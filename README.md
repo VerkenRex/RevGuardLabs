@@ -6,7 +6,7 @@ Small, self-contained n8n workflows for handling failed subscription payments. F
 
 `workflows/classify-failed-stripe-payments.json`
 
-![workflow canvas](images/canvas.png)
+![workflow canvas](canvas.png)
 
 Stripe's `invoice.payment_failed` webhook tells you a payment failed, but not why. The real decline code lives on the payment intent, and it decides what you should do next. Retrying an expired card is pointless, while `insufficient_funds` often clears if you wait for payday.
 
