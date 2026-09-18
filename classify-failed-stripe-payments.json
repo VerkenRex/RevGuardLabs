@@ -1,0 +1,413 @@
+{
+  "name": "Classify failed Stripe payments by decline code",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Classify failed Stripe payments by decline code\n\n**Who it's for:** anyone billing subscriptions on Stripe who wants to react to a failed payment the right way instead of retrying blindly.\n\n### How it works\n1. Stripe sends an `invoice.payment_failed` event to the webhook.\n2. Duplicate events are dropped (Stripe re-sends webhooks).\n3. The workflow fetches the payment intent, because the real decline code lives there, not on the invoice.\n4. The code is classified into one of four recovery plans: hard decline (never retry, ask for a new card), insufficient funds (retry near payday), technical error (retry within hours), or soft decline (standard retries).\n5. It also reports whether Stripe itself will retry: if `next_payment_attempt` is empty, Stripe has given up on that invoice.\n6. A Switch sends each case down its own branch, ready for your email, Slack, or retry logic.\n\n### Setup\n1. Add your Stripe credential to **Get payment intent from Stripe**.\n2. Activate the workflow and copy the webhook's Production URL.\n3. In Stripe: Developers, Webhooks, add an endpoint with that URL and the event `invoice.payment_failed`.\n4. Test with a Stripe test-mode card that declines.\n\n### Customization tips\nEdit the code lists in **Set decline code groups** to move a decline code to another plan. Replace the four placeholder nodes at the end with your own actions.",
+        "width": 640,
+        "height": 860
+      },
+      "id": "s0",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 1. Receive and dedupe\nStripe's event arrives and repeats are dropped.",
+        "width": 520,
+        "height": 320,
+        "color": 7
+      },
+      "id": "s1",
+      "name": "Section: receive",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Read the real decline code\nYour code groups, the payment intent from Stripe, then the classification.",
+        "width": 760,
+        "height": 320,
+        "color": 7
+      },
+      "id": "s2",
+      "name": "Section: decline code",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        500,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3. Route by recovery plan\nOne branch per plan. Replace the placeholders with your own actions.",
+        "width": 620,
+        "height": 760,
+        "color": 7
+      },
+      "id": "s3",
+      "name": "Section: route",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-failed-payment",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "n1",
+      "name": "Receive Stripe failed payment event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stripe re-sends webhooks. Drop any event id we have already seen (keeps the last 500).\nconst e = $input.first().json.body ?? $input.first().json;\nconst s = $getWorkflowStaticData(\"global\");\ns.seen = s.seen || [];\nif (e.id && s.seen.includes(e.id)) { return []; }\nif (e.id) { s.seen.push(e.id); if (s.seen.length > 500) s.seen = s.seen.slice(-500); }\nreturn $input.all();"
+      },
+      "id": "n2",
+      "name": "Skip duplicate events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "hardDeclineCodes",
+              "type": "string",
+              "value": "expired_card, incorrect_number, invalid_number, lost_card, stolen_card, pickup_card, invalid_account, account_closed, no_such_card"
+            },
+            {
+              "id": "a2",
+              "name": "insufficientFundsCodes",
+              "type": "string",
+              "value": "insufficient_funds"
+            },
+            {
+              "id": "a3",
+              "name": "technicalErrorCodes",
+              "type": "string",
+              "value": "processing_error, issuer_not_available, try_again_later, reenter_transaction"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "n3",
+      "name": "Set decline code groups",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        560,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.stripe.com/v1/payment_intents/{{ ($json.body?.data?.object?.payment_intent || '').toString().replace(/[^A-Za-z0-9_]/g, '') }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "stripeApi",
+        "options": {}
+      },
+      "id": "n4",
+      "name": "Get payment intent from Stripe",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        420
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the REAL decline code from the payment intent and pick a recovery plan.\nconst pi = $input.first().json || {};\nconst cfg = $(\"Set decline code groups\").first().json;\nconst w = $(\"Receive Stripe failed payment event\").first().json;\nconst evt = w.body ? w.body : w;\nconst o = (evt.data && evt.data.object) ? evt.data.object : {};\nconst list = (v) => String(v || \"\").split(\",\").map(x => x.trim()).filter(Boolean);\nconst lpe = pi.last_payment_error || null;\nconst code = lpe ? (lpe.decline_code || lpe.code) : \"unknown\";\nlet route = \"soft_retry\", action = \"Retry in 1, 3 and 7 days, then email the customer.\";\nif (list(cfg.hardDeclineCodes).includes(code)) { route = \"hard_no_retry\"; action = \"Do not retry. Email the customer a card-update link now.\"; }\nelse if (list(cfg.insufficientFundsCodes).includes(code)) { route = \"payday_retry\"; action = \"Retry after 24 hours, then on the 1st or 15th (payday).\"; }\nelse if (list(cfg.technicalErrorCodes).includes(code)) { route = \"technical_retry\"; action = \"Retry in 1, 6 and 24 hours. These usually clear on their own.\"; }\n// next_payment_attempt empty on the event = Stripe itself will NOT retry this invoice again.\nconst stripeWillRetry = (\"next_payment_attempt\" in o) ? !!o.next_payment_attempt : null;\nreturn [{ json: { invoice: o.id, customer: o.customer, email: o.customer_email || \"\", amount: (o.amount_due || 0) / 100, currency: o.currency || \"usd\",\n  declineCode: code, route, action, stripeWillRetry, attempt: o.attempt_count || 1 } }];"
+      },
+      "id": "n5",
+      "name": "Classify decline and suggest action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-hard_no_retry",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "hard_no_retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Hard decline"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-payday_retry",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "payday_retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Insufficient funds"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-technical_retry",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "technical_retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Technical error"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c-soft_retry",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "soft_retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Soft decline"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n6",
+      "name": "Route by recovery plan",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1360,
+        420
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n7",
+      "name": "Hard decline: ask for a new card",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1660,
+        180
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n8",
+      "name": "Insufficient funds: retry near payday",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1660,
+        340
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n9",
+      "name": "Technical error: retry within hours",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1660,
+        500
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "n10",
+      "name": "Soft decline: standard retries",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1660,
+        660
+      ]
+    }
+  ],
+  "connections": {
+    "Receive Stripe failed payment event": {
+      "main": [
+        [
+          {
+            "node": "Skip duplicate events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip duplicate events": {
+      "main": [
+        [
+          {
+            "node": "Set decline code groups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set decline code groups": {
+      "main": [
+        [
+          {
+            "node": "Get payment intent from Stripe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get payment intent from Stripe": {
+      "main": [
+        [
+          {
+            "node": "Classify decline and suggest action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify decline and suggest action": {
+      "main": [
+        [
+          {
+            "node": "Route by recovery plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by recovery plan": {
+      "main": [
+        [
+          {
+            "node": "Hard decline: ask for a new card",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insufficient funds: retry near payday",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Technical error: retry within hours",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Soft decline: standard retries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
